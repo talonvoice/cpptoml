@@ -14,10 +14,11 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <sstream>
-#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -54,48 +55,6 @@ using string_to_base_map
 // if defined, `base` will retain type information in form of an enum class
 // such that static_cast can be used instead of dynamic_cast
 // #define CPPTOML_NO_RTTI
-
-template <class T>
-class option
-{
-  public:
-    option() : empty_{true}
-    {
-        // nothing
-    }
-
-    option(T value) : empty_{false}, value_(std::move(value))
-    {
-        // nothing
-    }
-
-    explicit operator bool() const
-    {
-        return !empty_;
-    }
-
-    const T& operator*() const
-    {
-        return value_;
-    }
-
-    const T* operator->() const
-    {
-        return &value_;
-    }
-
-    template <class U>
-    T value_or(U&& alternative) const
-    {
-        if (!empty_)
-            return value_;
-        return static_cast<T>(std::forward<U>(alternative));
-    }
-
-  private:
-    bool empty_;
-    T value_;
-};
 
 struct local_date
 {
@@ -342,14 +301,9 @@ struct value_traits<
     static value_type construct(T&& val)
     {
         if (val < (std::numeric_limits<int64_t>::min)())
-            throw std::underflow_error{"constructed value cannot be "
-                                       "represented by a 64-bit signed "
-                                       "integer"};
-
+            return {};
         if (val > (std::numeric_limits<int64_t>::max)())
-            throw std::overflow_error{"constructed value cannot be represented "
-                                      "by a 64-bit signed integer"};
-
+            return {};
         return static_cast<int64_t>(val);
     }
 };
@@ -367,9 +321,7 @@ struct value_traits<
     static value_type construct(T&& val)
     {
         if (val > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)()))
-            throw std::overflow_error{"constructed value cannot be represented "
-                                      "by a 64-bit signed integer"};
-
+            return {};
         return static_cast<int64_t>(val);
     }
 };
@@ -381,13 +333,13 @@ class table_array;
 template <class T>
 struct array_of_trait
 {
-    using return_type = option<std::vector<T>>;
+    using return_type = std::optional<std::vector<T>>;
 };
 
 template <>
 struct array_of_trait<array>
 {
-    using return_type = option<std::vector<std::shared_ptr<array>>>;
+    using return_type = std::optional<std::vector<std::shared_ptr<array>>>;
 };
 
 template <class T>
@@ -900,10 +852,6 @@ class array : public base
         {
             values_.push_back(val);
         }
-        else
-        {
-            throw array_exception{"Arrays must be homogenous."};
-        }
     }
 
     /**
@@ -914,10 +862,6 @@ class array : public base
         if (values_.empty() || values_[0]->is_array())
         {
             values_.push_back(val);
-        }
-        else
-        {
-            throw array_exception{"Arrays must be homogenous."};
         }
     }
 
@@ -941,10 +885,6 @@ class array : public base
         {
             return values_.insert(position, value);
         }
-        else
-        {
-            throw array_exception{"Arrays must be homogenous."};
-        }
     }
 
     /**
@@ -956,10 +896,7 @@ class array : public base
         {
             return values_.insert(position, value);
         }
-        else
-        {
-            throw array_exception{"Arrays must be homogenous."};
-        }
+        return {};
     }
 
     /**
@@ -1218,19 +1155,17 @@ inline std::shared_ptr<table_array> make_element<table_array>()
 template <class T>
 typename std::enable_if<!std::is_floating_point<T>::value
                             && std::is_signed<T>::value,
-                        option<T>>::type
+                        std::optional<T>>::type
 get_impl(const std::shared_ptr<base>& elem)
 {
+    if (elem == nullptr)
+        return {};
     if (auto v = elem->as<int64_t>())
     {
         if (v->get() < (std::numeric_limits<T>::min)())
-            throw std::underflow_error{
-                "T cannot represent the value requested in get"};
-
+            return {};
         if (v->get() > (std::numeric_limits<T>::max)())
-            throw std::overflow_error{
-                "T cannot represent the value requested in get"};
-
+            return {};
         return {static_cast<T>(v->get())};
     }
     else
@@ -1242,18 +1177,17 @@ get_impl(const std::shared_ptr<base>& elem)
 template <class T>
 typename std::enable_if<!std::is_same<T, bool>::value
                             && std::is_unsigned<T>::value,
-                        option<T>>::type
+                        std::optional<T>>::type
 get_impl(const std::shared_ptr<base>& elem)
 {
+    if (elem == nullptr)
+        return {};
     if (auto v = elem->as<int64_t>())
     {
         if (v->get() < 0)
-            throw std::underflow_error{"T cannot store negative value in get"};
-
+            return {};
         if (static_cast<uint64_t>(v->get()) > (std::numeric_limits<T>::max)())
-            throw std::overflow_error{
-                "T cannot represent the value requested in get"};
-
+            return {};
         return {static_cast<T>(v->get())};
     }
     else
@@ -1265,9 +1199,11 @@ get_impl(const std::shared_ptr<base>& elem)
 template <class T>
 typename std::enable_if<!std::is_integral<T>::value
                             || std::is_same<T, bool>::value,
-                        option<T>>::type
+                        std::optional<T>>::type
 get_impl(const std::shared_ptr<base>& elem)
 {
+    if (elem == nullptr)
+        return {};
     if (auto v = elem->as<T>())
     {
         return {v->get()};
@@ -1334,6 +1270,11 @@ class table : public base
      */
     bool contains(const std::string& key) const
     {
+        // sometimes this is a nullptr if our table wasn't found in the parsed file.
+        // this guards against that case without being "undefined behavior" that might get optimized
+        if (reinterpret_cast<uintptr_t>(this) == 0) {
+            return false;
+        }
         return map_.find(key) != map_.end();
     }
 
@@ -1344,16 +1285,26 @@ class table : public base
      */
     bool contains_qualified(const std::string& key) const
     {
+        // this == nullptr guard
+        if (reinterpret_cast<uintptr_t>(this) == 0) {
+            return false;
+        }
         return resolve_qualified(key);
     }
 
     /**
      * Obtains the base for a given key.
-     * @throw std::out_of_range if the key does not exist
      */
     std::shared_ptr<base> get(const std::string& key) const
     {
-        return map_.at(key);
+        // this == nullptr guard
+        if (reinterpret_cast<uintptr_t>(this) == 0) {
+            return {};
+        }
+        auto it = map_.find(key);
+        if (it == map_.end())
+            return {};
+        return it->second;
     }
 
     /**
@@ -1361,7 +1312,6 @@ class table : public base
      * keys". Qualified keys are the full access path separated with
      * dots like "grandparent.parent.child".
      *
-     * @throw std::out_of_range if the key does not exist
      */
     std::shared_ptr<base> get_qualified(const std::string& key) const
     {
@@ -1375,6 +1325,10 @@ class table : public base
      */
     std::shared_ptr<table> get_table(const std::string& key) const
     {
+        // this == nullptr guard
+        if (reinterpret_cast<uintptr_t>(this) == 0) {
+            return nullptr;
+        }
         if (contains(key) && get(key)->is_table())
             return std::static_pointer_cast<table>(get(key));
         return nullptr;
@@ -1386,6 +1340,10 @@ class table : public base
      */
     std::shared_ptr<table> get_table_qualified(const std::string& key) const
     {
+        // this == nullptr guard
+        if (reinterpret_cast<uintptr_t>(this) == 0) {
+            return nullptr;
+        }
         if (contains_qualified(key) && get_qualified(key)->is_table())
             return std::static_pointer_cast<table>(get_qualified(key));
         return nullptr;
@@ -1438,16 +1396,9 @@ class table : public base
      * to the template parameter from a given key.
      */
     template <class T>
-    option<T> get_as(const std::string& key) const
+    std::optional<T> get_as(const std::string& key) const
     {
-        try
-        {
-            return get_impl<T>(get(key));
-        }
-        catch (const std::out_of_range&)
-        {
-            return {};
-        }
+        return get_impl<T>(get(key));
     }
 
     /**
@@ -1456,16 +1407,9 @@ class table : public base
      * keys".
      */
     template <class T>
-    option<T> get_qualified_as(const std::string& key) const
+    std::optional<T> get_qualified_as(const std::string& key) const
     {
-        try
-        {
-            return get_impl<T>(get_qualified(key));
-        }
-        catch (const std::out_of_range&)
-        {
-            return {};
-        }
+        return get_impl<T>(get_qualified(key));
     }
 
     /**
@@ -1536,6 +1480,10 @@ class table : public base
      */
     void insert(const std::string& key, const std::shared_ptr<base>& value)
     {
+        // this == nullptr guard
+        if (reinterpret_cast<uintptr_t>(this) == 0) {
+            return;
+        }
         map_[key] = value;
     }
 
@@ -1555,6 +1503,10 @@ class table : public base
      */
     void erase(const std::string& key)
     {
+        // this == nullptr guard
+        if (reinterpret_cast<uintptr_t>(this) == 0) {
+            return;
+        }
         map_.erase(key);
     }
 
@@ -1590,13 +1542,19 @@ class table : public base
     }
 
     // If output parameter p is specified, fill it with the pointer to the
-    // specified entry and throw std::out_of_range if it couldn't be found.
+    // specified entry
     //
     // Otherwise, just return true if the entry could be found or false
-    // otherwise and do not throw.
+    // otherwise
     bool resolve_qualified(const std::string& key,
                            std::shared_ptr<base>* p = nullptr) const
     {
+        // this == nullptr guard
+        if (reinterpret_cast<uintptr_t>(this) == 0) {
+            if (p)
+                *p = nullptr;
+            return false;
+        }
         auto parts = split(key, '.');
         auto last_key = parts.back();
         parts.pop_back();
@@ -1607,10 +1565,9 @@ class table : public base
             cur_table = cur_table->get_table(part).get();
             if (!cur_table)
             {
-                if (!p)
-                    return false;
-
-                throw std::out_of_range{key + " is not a valid key"};
+                if (p)
+                    *p = nullptr;
+                return false;
             }
         }
 
@@ -1887,7 +1844,6 @@ class parser
 
     /**
      * Parses the stream this parser was created on until EOF.
-     * @throw parse_exception if there are errors in parsing
      */
     std::shared_ptr<table> parse()
     {
@@ -1919,14 +1875,9 @@ class parser
     }
 
   private:
-#if defined _MSC_VER
-    __declspec(noreturn)
-#elif defined __GNUC__
-    __attribute__((noreturn))
-#endif
-        void throw_parse_exception(const std::string& err)
+    void throw_parse_exception(const std::string& err)
     {
-        throw parse_exception{err, line_number_};
+        std::cerr << "Parse error: " << err << std::endl;
     }
 
     void parse_table(std::string::iterator& it,
@@ -2206,6 +2157,7 @@ class parser
         }
 
         throw_parse_exception("Unexpected end of key");
+        return {};
     }
 
     std::string parse_simple_key(std::string::iterator& it,
@@ -2350,6 +2302,7 @@ class parser
             return parse_type::INLINE_TABLE;
         }
         throw_parse_exception("Failed to parse value type");
+        return {};
     }
 
     parse_type determine_number_type(const std::string::iterator& it,
@@ -2488,6 +2441,7 @@ class parser
         }
 
         throw_parse_exception("Unterminated multi-line basic string");
+        return {};
     }
 
     std::string string_literal(std::string::iterator& it,
@@ -2514,6 +2468,7 @@ class parser
             }
         }
         throw_parse_exception("Unterminated string literal");
+        return {};
     }
 
     std::string parse_escape_code(std::string::iterator& it,
@@ -2792,20 +2747,7 @@ class parser
         v = prefix + v;
         v.erase(std::remove(v.begin(), v.end(), '_'), v.end());
         it = end;
-        try
-        {
-            return make_value<int64_t>(std::stoll(v, nullptr, base));
-        }
-        catch (const std::invalid_argument& ex)
-        {
-            throw_parse_exception("Malformed number (invalid argument: "
-                                  + std::string{ex.what()} + ")");
-        }
-        catch (const std::out_of_range& ex)
-        {
-            throw_parse_exception("Malformed number (out of range: "
-                                  + std::string{ex.what()} + ")");
-        }
+        return make_value<int64_t>(std::stoll(v, nullptr, base));
     }
 
     std::shared_ptr<value<double>> parse_float(std::string::iterator& it,
@@ -2816,20 +2758,7 @@ class parser
         it = end;
         char decimal_point = std::localeconv()->decimal_point[0];
         std::replace(v.begin(), v.end(), '.', decimal_point);
-        try
-        {
-            return make_value<double>(std::stod(v));
-        }
-        catch (const std::invalid_argument& ex)
-        {
-            throw_parse_exception("Malformed number (invalid argument: "
-                                  + std::string{ex.what()} + ")");
-        }
-        catch (const std::out_of_range& ex)
-        {
-            throw_parse_exception("Malformed number (out of range: "
-                                  + std::string{ex.what()} + ")");
-        }
+        return make_value<double>(std::stod(v));
     }
 
     std::shared_ptr<value<bool>> parse_bool(std::string::iterator& it,
@@ -3176,7 +3105,7 @@ class parser
         return true;
     }
 
-    option<parse_type> date_type(const std::string::iterator& it,
+    std::optional<parse_type> date_type(const std::string::iterator& it,
                                  const std::string::iterator& end)
     {
         auto date_end = find_end_of_date(it, end);
@@ -3226,7 +3155,7 @@ inline std::shared_ptr<table> parse_file(const std::string& filename)
     std::ifstream file{filename};
 #endif
     if (!file.is_open())
-        throw parse_exception{filename + " could not be opened for parsing"};
+        return nullptr;
     parser p{file};
     return p.parse();
 }
